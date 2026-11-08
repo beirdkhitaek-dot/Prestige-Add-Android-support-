@@ -1,0 +1,64 @@
+name: Build addon
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # MojoLauncher runs Android, so desktop-only Java APIs crash the game.
+      # This step fails the build early if any slip into the addon.
+      - name: Android safety check
+        run: |
+          if grep -rEn "java\.awt|javax\.swing|java\.awt\.Desktop|SystemTray|ProcessBuilder|Runtime\.getRuntime\(\)\.exec|System\.loadLibrary|System\.load\(" src/main/java; then
+            echo "::error::Desktop-only API found (see lines above). Remove it or guard it so it never runs on Android."
+            exit 1
+          fi
+          echo "No desktop-only APIs found."
+
+      - name: Build
+        run: |
+          chmod +x gradlew
+          ./gradlew build --no-daemon
+
+      - name: Name the jar FutureDebugSkidByChukl-<version>.jar
+        id: jar
+        run: |
+          VERSION=$(grep -E '^(mod_version|version)\s*=' gradle.properties | head -n1 | cut -d= -f2 | tr -d '[:space:]')
+          VERSION=${VERSION:-0.0.0}
+          # Tag builds use the tag as the version, e.g. v1.0.1 -> 1.0.1
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then VERSION="${GITHUB_REF_NAME#v}"; fi
+          mkdir -p dist
+          JAR=$(ls build/libs/*.jar | grep -vE 'sources|dev|javadoc' | head -n1)
+          cp "$JAR" "dist/FutureDebugSkidByChukl-${VERSION}.jar"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FutureDebugSkidByChukl-${{ steps.jar.outputs.version }}
+          path: dist/*.jar
+
+      - name: Publish release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.jar
+          generate_release_notes: true
