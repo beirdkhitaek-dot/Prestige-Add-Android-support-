@@ -1,0 +1,226 @@
+name: Build from source zip
+
+# Put the source zip (e.g. openprestige-android-src.zip) in the repository ROOT on main.
+# Every push that adds/changes a root-level .zip unzips it and builds everything.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "*.zip"
+  workflow_dispatch:
+    inputs:
+      zip:
+        description: "Zip file in repo root to build (blank = the zip changed by the last commit)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # needed only by the release job
+
+concurrency:
+  group: build-from-zip-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  extract:
+    name: Unzip source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Pick and unzip the source archive
+        env:
+          INPUT_ZIP: ${{ inputs.zip }}
+        run: |
+          set -eu
+          zip="$INPUT_ZIP"
+          if [ -z "$zip" ]; then
+            zip="$(git diff --name-only --diff-filter=AM HEAD~1 HEAD -- '*.zip' 2>/dev/null | grep -v / | head -n1 || true)"
+          fi
+          if [ -z "$zip" ]; then
+            zip="$(ls -1 ./*.zip 2>/dev/null | head -n1 | sed 's|^\./||' || true)"
+          fi
+          [ -n "$zip" ] && [ -f "$zip" ] || { echo "No .zip found in the repository root"; exit 1; }
+          echo "Building from: $zip"
+          rm -rf unpack project
+          mkdir unpack
+          unzip -q "$zip" -d unpack
+          gradlew="$(find unpack -maxdepth 3 -name gradlew -print -quit)"
+          [ -n "$gradlew" ] || { echo "gradlew not found inside $zip"; exit 1; }
+          mv "$(dirname "$gradlew")" project
+          chmod +x project/gradlew project/*.sh 2>/dev/null || true
+          grep -E '^mod_version=' project/gradle.properties
+          # tar keeps the executable bits that upload-artifact would drop
+          tar -cf project.tar project
+      - uses: actions/upload-artifact@v4
+        with:
+          name: project-source
+          path: project.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  natives:
+    name: ImGui native (${{ matrix.platform }})
+    needs: extract
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, platform: windows-x86_64,  toolchain: windows-x86_64 }
+          - { os: ubuntu-latest, platform: windows-aarch64, toolchain: windows-aarch64 }
+          - { os: ubuntu-latest, platform: linux-x86_64,    toolchain: "" }
+          - { os: ubuntu-latest, platform: linux-aarch64,   toolchain: linux-aarch64 }
+          - { os: macos-14,      platform: macos-universal, toolchain: macos-universal }
+          - { os: ubuntu-latest, platform: android-aarch64, toolchain: android-aarch64 }
+          - { os: ubuntu-latest, platform: android-x86_64,  toolchain: android-x86_64 }
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: project-source
+      - name: Extract
+        shell: bash
+        run: tar -xf project.tar
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ g++-aarch64-linux-gnu
+      - name: Install Windows cross compiler
+        if: startsWith(matrix.platform, 'windows-')
+        run: |
+          curl -fL --retry 3 https://github.com/mstorsjo/llvm-mingw/releases/download/20261020/llvm-mingw-20261020-ucrt-ubuntu-22.04-x86_64.tar.xz -o "$RUNNER_TEMP/llvm-mingw.tar.xz"
+          tar -xf "$RUNNER_TEMP/llvm-mingw.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/llvm-mingw-20261020-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
+      - name: Locate Android NDK
+        if: startsWith(matrix.platform, 'android-')
+        run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+      - name: Build core-only ImGui
+        working-directory: project
+        env:
+          TOOLCHAIN: ${{ matrix.toolchain }}
+        run: |
+          if [ -n "$TOOLCHAIN" ]; then
+            python3 scripts/build_imgui_core.py --output "build/core-natives/${{ matrix.platform }}" --toolchain "scripts/imgui-core/toolchains/$TOOLCHAIN.cmake"
+          else
+            python3 scripts/build_imgui_core.py --output "build/core-natives/${{ matrix.platform }}"
+          fi
+      - name: Smoke test
+        if: matrix.platform == 'linux-x86_64' || matrix.platform == 'macos-universal'
+        working-directory: project
+        run: |
+          java -Dimgui.library.path="$PWD/build/core-natives/${{ matrix.platform }}" -cp build/imgui-core/deps/imgui-java-binding-1.92.7.1.jar scripts/imgui-core/SmokeTest.java src/main/resources/prestige_ui/fonts/DMSans-Regular.ttf
+      - uses: actions/upload-artifact@v4
+        with:
+          name: imgui-${{ matrix.platform }}
+          path: project/build/core-natives/*
+          if-no-files-found: error
+
+  mod-jar:
+    name: Fabric mod jar (with Android natives)
+    needs: natives
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: project-source
+      - name: Extract
+        run: tar -xf project.tar
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: imgui-*
+          merge-multiple: true
+          path: project/build/core-natives
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+      - name: Build remapped jar
+        working-directory: project
+        run: ./gradlew remapJar --console=plain
+      - name: Check Android natives are in the jar
+        working-directory: project
+        run: |
+          jar="$(ls build/libs/prestige-*.jar | grep -v -e -dev.jar -e -sources.jar | head -n1)"
+          echo "$jar"
+          unzip -l "$jar" | grep -E 'prestige-natives/(android|linux|windows|macos)'
+          unzip -l "$jar" | grep -q 'prestige-natives/android-aarch64/libimgui-java64.so'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: payload-jar   # also the Fabric mod: drop into mods/
+          path: |
+            project/build/libs/prestige-*.jar
+            !project/build/libs/*-dev.jar
+            !project/build/libs/*-sources.jar
+          if-no-files-found: error
+
+  injector:
+    name: Injector (${{ matrix.name }})
+    needs: mod-jar
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,   name: windows-x86_64,  bin: OpenPrestigeInjector.exe, lib: prestige_native.dll }
+          - { os: windows-11-arm,   target: aarch64-pc-windows-msvc,  name: windows-aarch64, bin: OpenPrestigeInjector.exe, lib: prestige_native.dll }
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu, name: linux-x86_64,    bin: OpenPrestigeInjector,     lib: libprestige_native.so }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: linux-aarch64,  bin: OpenPrestigeInjector,     lib: libprestige_native.so }
+          - { os: macos-15-intel,   target: x86_64-apple-darwin,      name: macos-x86_64,    bin: OpenPrestigeInjector,     lib: libprestige_native.dylib }
+          - { os: macos-14,         target: aarch64-apple-darwin,     name: macos-aarch64,   bin: OpenPrestigeInjector,     lib: libprestige_native.dylib }
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: project-source
+      - name: Extract
+        shell: bash
+        run: tar -xf project.tar
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: payload-jar
+          path: project/build/libs
+      - name: Build
+        working-directory: project
+        run: cargo build --release --manifest-path injector/Cargo.toml
+      - name: Test
+        working-directory: project
+        run: cargo test --manifest-path injector/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openprestige-${{ matrix.name }}
+          path: |
+            project/injector/target/release/${{ matrix.bin }}
+            project/injector/target/release/${{ matrix.lib }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: github.event_name == 'push'
+    needs: [mod-jar, injector]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: payload-jar
+          path: release
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd release
+          sha256sum *.jar > SHA256SUMS.txt
+          tag="build-${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" *.jar SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --title "Build $GITHUB_RUN_NUMBER" \
+            --notes "Built from the source zip in commit $GITHUB_SHA. Drop the jar into your Fabric mods folder (also works in Android launchers)."
