@@ -72,7 +72,7 @@ jobs:
           - { os: ubuntu-latest, platform: windows-aarch64, toolchain: windows-aarch64 }
           - { os: ubuntu-latest, platform: linux-x86_64,    toolchain: "" }
           - { os: ubuntu-latest, platform: linux-aarch64,   toolchain: linux-aarch64 }
-          - { os: macos-14,      platform: macos-universal, toolchain: macos-universal }
+          - { os: macos-15,      platform: macos-universal, toolchain: macos-universal }
           - { os: ubuntu-latest, platform: android-aarch64, toolchain: android-aarch64 }
           - { os: ubuntu-latest, platform: android-x86_64,  toolchain: android-x86_64 }
     steps:
@@ -175,7 +175,7 @@ jobs:
           - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu, name: linux-x86_64,    bin: OpenPrestigeInjector,     lib: libprestige_native.so }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: linux-aarch64,  bin: OpenPrestigeInjector,     lib: libprestige_native.so }
           - { os: macos-15-intel,   target: x86_64-apple-darwin,      name: macos-x86_64,    bin: OpenPrestigeInjector,     lib: libprestige_native.dylib }
-          - { os: macos-14,         target: aarch64-apple-darwin,     name: macos-aarch64,   bin: OpenPrestigeInjector,     lib: libprestige_native.dylib }
+          - { os: macos-15,         target: aarch64-apple-darwin,     name: macos-aarch64,   bin: OpenPrestigeInjector,     lib: libprestige_native.dylib }
     steps:
       - uses: actions/download-artifact@v4
         with:
