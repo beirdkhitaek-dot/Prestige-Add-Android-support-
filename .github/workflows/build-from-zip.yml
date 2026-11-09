@@ -206,8 +206,7 @@ jobs:
 
   release:
     name: Publish release
-    if: github.event_name == 'push'
-    needs: [mod-jar, injector]
+    needs: mod-jar
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
